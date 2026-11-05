@@ -1,7 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { BridgeServer } from "./server.js";
-import { ToolStreamParser } from "./tool-bridge.js";
+import { spawnSync } from "node:child_process";
+import * as lib from "./index.js";
+import { BridgeServer, SessionManager, ToolStreamParser, buildSystemPromptAppend, formatAgentInternalToolUpdate, } from "./index.js";
+function isAgyAvailable() {
+    if (process.env.AGY_SKIP_LIVE_E2E === "true") {
+        return false;
+    }
+    const check = spawnSync("which", ["agy"], { encoding: "utf8" });
+    return check.status === 0 && Boolean(check.stdout?.trim());
+}
+test("Library entrypoint (index.js) exports public classes and helpers without side effects", () => {
+    assert.equal(typeof lib.BridgeServer, "function");
+    assert.equal(typeof lib.AcpClient, "function");
+    assert.equal(typeof lib.SessionManager, "function");
+    assert.equal(typeof lib.ToolStreamParser, "function");
+    assert.equal(typeof buildSystemPromptAppend, "function");
+    assert.equal(typeof formatAgentInternalToolUpdate, "function");
+});
 test("ToolStreamParser extracts <agy_tool_call> across chunk boundaries", () => {
     const parser = new ToolStreamParser(true);
     const s1 = parser.push("Let me check the weather. <agy_tool");
@@ -18,7 +34,68 @@ test("ToolStreamParser extracts <agy_tool_call> across chunk boundaries", () => 
         city: "Jakarta",
     });
 });
-test("End-to-end BridgeServer: /v1/models, multi-turn session reuse, streaming, and OpenAI tool_calls", async () => {
+test("SessionManager reuses session on append-only turns and creates new session on history edit (offline)", async () => {
+    let nextId = 1;
+    const fakeAcp = {
+        async newSession() {
+            return {
+                sessionId: `sess_${nextId++}`,
+                availableModels: [],
+                currentModelId: "gemini-3.8-flash-low",
+            };
+        },
+        async setModel() { },
+        async closeSession() { },
+    };
+    const manager = new SessionManager(fakeAcp, 10);
+    // Turn 1
+    const turn1 = await manager.acquireSession({
+        baseModelId: "gemini-3.8-flash-low",
+        isAgentMode: false,
+        cwd: "/tmp",
+        systemPromptAppend: "sys",
+        nonSystemMessages: [{ role: "user", content: "Hello" }],
+    });
+    assert.equal(turn1.reused, false);
+    assert.equal(turn1.sessionId, "sess_1");
+    turn1.finalizeTurn("Hi there!", []);
+    // Turn 2 (append-only)
+    const turn2 = await manager.acquireSession({
+        baseModelId: "gemini-3.8-flash-low",
+        isAgentMode: false,
+        cwd: "/tmp",
+        systemPromptAppend: "sys",
+        nonSystemMessages: [
+            { role: "user", content: "Hello" },
+            { role: "assistant", content: "Hi there!" },
+            { role: "user", content: "Follow-up question" },
+        ],
+    });
+    assert.equal(turn2.reused, true);
+    assert.equal(turn2.sessionId, "sess_1");
+    turn2.finalizeTurn("Follow-up answer", []);
+    // Turn 3 with mutated history prefix -> should allocate sess_2
+    const turn3Mutated = await manager.acquireSession({
+        baseModelId: "gemini-3.8-flash-low",
+        isAgentMode: false,
+        cwd: "/tmp",
+        systemPromptAppend: "sys",
+        nonSystemMessages: [
+            { role: "user", content: "Edited first message" },
+            { role: "assistant", content: "Hi there!" },
+            { role: "user", content: "Follow-up question" },
+        ],
+    });
+    assert.equal(turn3Mutated.reused, false);
+    assert.equal(turn3Mutated.sessionId, "sess_2");
+    turn3Mutated.finalizeTurn("Fresh answer", []);
+});
+const hasAgy = isAgyAvailable();
+test("End-to-end BridgeServer: /v1/models, multi-turn session reuse, streaming, and OpenAI tool_calls", {
+    skip: !hasAgy
+        ? "agy binary not found on PATH or AGY_SKIP_LIVE_E2E=true"
+        : false,
+}, async () => {
     const port = 18787;
     const bridge = new BridgeServer({
         port,

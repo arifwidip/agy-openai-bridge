@@ -1,17 +1,54 @@
 {
   "name": "agy-openai-bridge",
   "version": "0.1.0",
-  "description": "OpenAI-compatible API bridge for Antigravity CLI (agy acp)",
+  "description": "OpenAI-compatible HTTP/SSE API bridge for Antigravity CLI (agy acp)",
   "type": "module",
-  "main": "./dist/cli.js",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "bin": {
     "agy-openai-bridge": "./dist/cli.js"
   },
+  "files": [
+    "dist",
+    "!dist/test.*"
+  ],
   "scripts": {
-    "build": "tsc",
+    "build": "rm -rf dist && tsc",
     "start": "node ./dist/cli.js",
     "dev": "tsx ./src/cli.ts",
-    "test": "node --test ./dist/test.js"
+    "test": "node --test ./dist/test.js",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "antigravity",
+    "agy",
+    "acp",
+    "agent-client-protocol",
+    "openai",
+    "openai-compatible",
+    "bridge",
+    "proxy",
+    "opencode",
+    "roo-code",
+    "cline",
+    "continue",
+    "llm"
+  ],
+  "author": "Arif Widipratomo <arif.widip@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arifwidip/agy-openai-bridge.git"
+  },
+  "homepage": "https://github.com/arifwidip/agy-openai-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/arifwidip/agy-openai-bridge/issues"
   },
   "engines": {
     "node": ">=20.0.0"
