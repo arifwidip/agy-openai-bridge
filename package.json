@@ -1,0 +1,24 @@
+{
+  "name": "agy-openai-bridge",
+  "version": "0.1.0",
+  "description": "OpenAI-compatible API bridge for Antigravity CLI (agy acp)",
+  "type": "module",
+  "main": "./dist/cli.js",
+  "bin": {
+    "agy-openai-bridge": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node ./dist/cli.js",
+    "dev": "tsx ./src/cli.ts",
+    "test": "node --test ./dist/test.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
