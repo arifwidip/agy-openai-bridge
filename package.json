@@ -12,7 +12,7 @@
     }
   },
   "bin": {
-    "agy-openai-bridge": "./dist/cli.js"
+    "agy-openai-bridge": "dist/cli.js"
   },
   "files": [
     "dist",
