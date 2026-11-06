@@ -1,6 +1,6 @@
 {
   "name": "agy-openai-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenAI-compatible HTTP/SSE API bridge for Antigravity CLI (agy acp)",
   "type": "module",
   "main": "./dist/index.js",
