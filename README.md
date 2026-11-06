@@ -9,6 +9,9 @@ Connect coding agents (**OpenCode**, **Roo Code**, **Cline**, **Continue**, **Ai
 ## Features
 
 - **Persistent `agy acp` Process**: Spawns `agy acp` once and multiplexes JSON-RPC 2.0 sessions over `stdio` with zero per-request cold-start overhead.
+- **Background Session Pre-warming**: Pre-warms a standby ACP session in the background so Turn 1 of any new conversation or task starts in 0ms instead of blocking synchronously for ~3.8s.
+- **Fast Title & Utility Bypass**: Automatically detects background utility requests (such as OpenCode thread title generators) and routes them to an isolated, persistent utility session on the fastest available `-low` model (`gemini-3.8-flash-low`, ~300ms), preventing double cold-starts and protecting the main agent session cache.
+- **Progressive Tool Argument Streaming**: Streams tool call `function.arguments` incrementally via `delta.tool_calls[0].function.arguments` as chunks arrive from `agy`, eliminating client UI freezing during multi-line file writes and code generations.
 - **Dual-Mode via Model ID**:
   - **Standard Mode (`<model>`, e.g. `claude-sonnet-5-5-high`, `gemini-4-argon-high`)**: Suppresses `agy`'s internal workspace tools and translates OpenAI `tools` / `tool_calls` so external coding agents (OpenCode, Roo Code, Cline, Continue) have full control over file edits and commands.
   - **Agent Mode (`<model>-agent`, e.g. `claude-sonnet-5-5-high-agent`)**: Lets `agy` execute its own built-in tools (`read_file`, `edit_file`, `run_command`, MCP servers) in the target workspace and streams tool activity into `reasoning_content`.

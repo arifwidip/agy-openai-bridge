@@ -49,6 +49,25 @@ export class BridgeServer {
 
   public async start(): Promise<void> {
     await this.acp.ensureStarted();
+    // Pre-warm standby session in background for immediate Turn-1 readiness
+    this.acp
+      .getFastestLowModel()
+      .then((fastModel) => {
+        this.sessions.triggerReplenishStandby({
+          baseModelId: fastModel,
+          isAgentMode: false,
+          cwd: this.config.defaultCwd,
+          systemPromptAppend: "",
+          systemHash: this.sessions.hashObject({
+            baseModelId: fastModel,
+            isAgentMode: false,
+            cwd: this.config.defaultCwd,
+            systemPromptAppend: "",
+          }),
+        });
+      })
+      .catch(() => {});
+
     return new Promise((resolve) => {
       this.server.listen(this.config.port, this.config.host, () => {
         resolve();
@@ -212,25 +231,32 @@ export class BridgeServer {
       }
     }
 
+    const isUtility = this.isUtilityPrompt(body);
+
     const hasClientTools =
+      !isUtility &&
       !isAgentMode &&
       Array.isArray(body.tools) &&
       body.tools.length > 0 &&
       body.tool_choice !== "none";
 
-    const systemPromptAppend = buildSystemPromptAppend(
-      body,
-      systemMessages,
-      isAgentMode
-    );
+    const systemPromptAppend = isUtility
+      ? ""
+      : buildSystemPromptAppend(body, systemMessages, isAgentMode);
 
-    const acquired = await this.sessions.acquireSession({
-      baseModelId,
-      isAgentMode,
-      cwd: resolvedCwd,
-      systemPromptAppend,
-      nonSystemMessages,
-    });
+    const acquired = isUtility
+      ? await this.sessions.acquireUtilitySession({
+          cwd: resolvedCwd,
+          messages: nonSystemMessages,
+          systemInstructions: systemMessages.join("\n"),
+        })
+      : await this.sessions.acquireSession({
+          baseModelId,
+          isAgentMode,
+          cwd: resolvedCwd,
+          systemPromptAppend,
+          nonSystemMessages,
+        });
 
     const completionId = `chatcmpl-${crypto.randomBytes(12).toString("hex")}`;
     const created = Math.floor(Date.now() / 1000);
@@ -320,11 +346,11 @@ export class BridgeServer {
 
     let fullAssistantText = "";
     const allToolCalls: OpenAIToolCall[] = [];
-    let nextToolIndex = 0;
 
     const emitParsedStep = (step: {
       textDelta: string;
       toolCalls: OpenAIToolCall[];
+      toolCallDeltas: import("./types.js").OpenAIToolCallDelta[];
     }) => {
       if (step.textDelta) {
         fullAssistantText += step.textDelta;
@@ -332,16 +358,18 @@ export class BridgeServer {
       }
       for (const tc of step.toolCalls) {
         allToolCalls.push(tc);
-        const idx = nextToolIndex++;
+      }
+      for (const delta of step.toolCallDeltas) {
         writeChunk({
           tool_calls: [
             {
-              index: idx,
-              id: tc.id,
-              type: "function",
+              index: delta.index,
+              ...(delta.id ? { id: delta.id, type: "function" } : {}),
               function: {
-                name: tc.function.name,
-                arguments: tc.function.arguments,
+                ...(delta.function?.name ? { name: delta.function.name } : {}),
+                ...(delta.function?.arguments !== undefined
+                  ? { arguments: delta.function.arguments }
+                  : {}),
               },
             },
           ],
@@ -622,6 +650,39 @@ export class BridgeServer {
       isAgentMode,
       responseModelId: isAgentMode ? `${fallback}-agent` : fallback,
     };
+  }
+
+  private isUtilityPrompt(body: OpenAIChatCompletionRequest): boolean {
+    if (
+      Array.isArray(body.tools) &&
+      body.tools.length > 0 &&
+      body.tool_choice !== "none"
+    ) {
+      return false;
+    }
+    if (!Array.isArray(body.messages) || body.messages.length > 3) {
+      return false;
+    }
+    for (const msg of body.messages) {
+      if (msg.role === "system" || msg.role === "developer") {
+        const text =
+          typeof msg.content === "string"
+            ? msg.content
+            : Array.isArray(msg.content)
+            ? msg.content
+                .map((c) => (c.type === "text" ? c.text : ""))
+                .join(" ")
+            : "";
+        if (
+          /title generator|generate a brief title|output only a thread title|brief title that would help/i.test(
+            text
+          )
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   private checkAuthAndExtractCwd(req: http.IncomingMessage): {

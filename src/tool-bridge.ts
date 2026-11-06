@@ -3,6 +3,7 @@ import {
   AcpSessionUpdate,
   OpenAIChatCompletionRequest,
   OpenAIToolCall,
+  OpenAIToolCallDelta,
   OpenAIToolDefinition,
 } from "./types.js";
 
@@ -73,7 +74,7 @@ function buildClientToolInstructions(
   return [
     "CLIENT-PROVIDED OPENAI TOOLS:",
     "You have access to the following external tools executed by the API client (do NOT confuse these with your disabled built-in tools):",
-    JSON.stringify(toolSpecs, null, 2),
+    JSON.stringify(toolSpecs),
     "",
     choiceRule,
     "",
@@ -92,16 +93,23 @@ function buildClientToolInstructions(
 export interface ParsedStreamStep {
   textDelta: string;
   toolCalls: OpenAIToolCall[];
+  toolCallDeltas: OpenAIToolCallDelta[];
 }
 
 /**
  * Streaming parser that extracts `<agy_tool_call>{"name":...,"arguments":...}</agy_tool_call>`
- * while streaming normal text immediately with zero buffering outside potential tag prefixes.
+ * while streaming normal text immediately and progressively emitting tool call argument deltas.
  */
 export class ToolStreamParser {
   private buffer = "";
   private inTag = false;
   private enabled: boolean;
+  private currentToolIndex = 0;
+  private currentToolId = "";
+  private currentToolName = "";
+  private streamingArgs = false;
+  private alreadyStreamedArgs = "";
+  private tagBuffer = "";
 
   constructor(enabled: boolean) {
     this.enabled = enabled;
@@ -109,12 +117,13 @@ export class ToolStreamParser {
 
   public push(chunk: string): ParsedStreamStep {
     if (!this.enabled) {
-      return { textDelta: chunk, toolCalls: [] };
+      return { textDelta: chunk, toolCalls: [], toolCallDeltas: [] };
     }
 
     this.buffer += chunk;
     let textDelta = "";
     const toolCalls: OpenAIToolCall[] = [];
+    const toolCallDeltas: OpenAIToolCallDelta[] = [];
 
     while (this.buffer.length > 0) {
       if (!this.inTag) {
@@ -123,6 +132,11 @@ export class ToolStreamParser {
           textDelta += this.buffer.slice(0, openIdx);
           this.buffer = this.buffer.slice(openIdx + OPEN_TAG.length);
           this.inTag = true;
+          this.tagBuffer = "";
+          this.streamingArgs = false;
+          this.currentToolId = "";
+          this.currentToolName = "";
+          this.alreadyStreamedArgs = "";
           continue;
         }
 
@@ -143,42 +157,179 @@ export class ToolStreamParser {
       } else {
         const closeIdx = this.buffer.indexOf(CLOSE_TAG);
         if (closeIdx !== -1) {
-          const rawJson = this.buffer.slice(0, closeIdx).trim();
+          const chunkInsideTag = this.buffer.slice(0, closeIdx);
+          this.tagBuffer += chunkInsideTag;
           this.buffer = this.buffer.slice(closeIdx + CLOSE_TAG.length);
           this.inTag = false;
 
-          const parsed = this.tryParseToolCall(rawJson);
+          const parsed = this.tryParseToolCall(this.tagBuffer);
           if (parsed) {
+            if (this.currentToolId) {
+              parsed.id = this.currentToolId;
+            } else {
+              this.currentToolId = parsed.id;
+            }
+
+            if (!this.streamingArgs) {
+              toolCallDeltas.push({
+                index: this.currentToolIndex,
+                id: parsed.id,
+                type: "function",
+                function: {
+                  name: parsed.function.name,
+                  arguments: parsed.function.arguments,
+                },
+              });
+            } else {
+              const finalArgs = parsed.function.arguments;
+              const remaining = finalArgs.slice(this.alreadyStreamedArgs.length);
+              if (remaining.length > 0) {
+                toolCallDeltas.push({
+                  index: this.currentToolIndex,
+                  function: {
+                    arguments: remaining,
+                  },
+                });
+              }
+            }
+
             toolCalls.push(parsed);
+            this.currentToolIndex++;
           } else {
             // If malformed JSON, emit raw text back so nothing is lost
-            textDelta += `${OPEN_TAG}${rawJson}${CLOSE_TAG}`;
+            textDelta += `${OPEN_TAG}${this.tagBuffer}${CLOSE_TAG}`;
           }
+
+          this.tagBuffer = "";
+          this.streamingArgs = false;
+          this.currentToolId = "";
+          this.currentToolName = "";
+          this.alreadyStreamedArgs = "";
           continue;
         }
-        // Still waiting for CLOSE_TAG
+
+        // CLOSE_TAG not found yet. Check partial suffix of CLOSE_TAG.
+        const partialCloseLen = this.findPartialSuffixLength(
+          this.buffer,
+          CLOSE_TAG
+        );
+        const safeEnd = this.buffer.length - partialCloseLen;
+        if (safeEnd <= 0) {
+          break;
+        }
+
+        const safeNewText = this.buffer.slice(0, safeEnd);
+        this.tagBuffer += safeNewText;
+        this.buffer = this.buffer.slice(safeEnd);
+
+        if (!this.streamingArgs) {
+          const nameMatch = /"name"\s*:\s*"([^"]+)"/.exec(this.tagBuffer);
+          const argsMatch = /"arguments"\s*:\s*/.exec(this.tagBuffer);
+
+          if (nameMatch && argsMatch) {
+            this.currentToolName = nameMatch[1];
+            this.currentToolId = `call_${crypto.randomBytes(12).toString("hex")}`;
+            this.streamingArgs = true;
+
+            toolCallDeltas.push({
+              index: this.currentToolIndex,
+              id: this.currentToolId,
+              type: "function",
+              function: {
+                name: this.currentToolName,
+                arguments: "",
+              },
+            });
+
+            const argStartIndex = argsMatch.index + argsMatch[0].length;
+            const rawArgsSoFar = this.tagBuffer.slice(argStartIndex);
+            if (rawArgsSoFar.length > 4) {
+              const emitLen = rawArgsSoFar.length - 4;
+              const toEmit = rawArgsSoFar.slice(0, emitLen);
+              toolCallDeltas.push({
+                index: this.currentToolIndex,
+                function: {
+                  arguments: toEmit,
+                },
+              });
+              this.alreadyStreamedArgs += toEmit;
+            }
+          }
+        } else {
+          const argsMatch = /"arguments"\s*:\s*/.exec(this.tagBuffer);
+          if (argsMatch) {
+            const argStartIndex = argsMatch.index + argsMatch[0].length;
+            const totalArgsSoFar = this.tagBuffer.slice(argStartIndex);
+            const unstreamed = totalArgsSoFar.slice(
+              this.alreadyStreamedArgs.length
+            );
+            if (unstreamed.length > 4) {
+              const toEmit = unstreamed.slice(0, unstreamed.length - 4);
+              toolCallDeltas.push({
+                index: this.currentToolIndex,
+                function: {
+                  arguments: toEmit,
+                },
+              });
+              this.alreadyStreamedArgs += toEmit;
+            }
+          }
+        }
         break;
       }
     }
 
-    return { textDelta, toolCalls };
+    return { textDelta, toolCalls, toolCallDeltas };
   }
 
   public flush(): ParsedStreamStep {
-    if (!this.enabled || this.buffer.length === 0) {
-      return { textDelta: "", toolCalls: [] };
+    if (!this.enabled) {
+      return { textDelta: "", toolCalls: [], toolCallDeltas: [] };
     }
-    const leftover = this.buffer;
+    const leftover = this.tagBuffer + this.buffer;
     this.buffer = "";
+    this.tagBuffer = "";
+
     if (this.inTag) {
       this.inTag = false;
       const parsed = this.tryParseToolCall(leftover.trim());
       if (parsed) {
-        return { textDelta: "", toolCalls: [parsed] };
+        if (this.currentToolId) {
+          parsed.id = this.currentToolId;
+        }
+        const toolCallDeltas: OpenAIToolCallDelta[] = [];
+        if (!this.streamingArgs) {
+          toolCallDeltas.push({
+            index: this.currentToolIndex,
+            id: parsed.id,
+            type: "function",
+            function: {
+              name: parsed.function.name,
+              arguments: parsed.function.arguments,
+            },
+          });
+        } else {
+          const finalArgs = parsed.function.arguments;
+          const remaining = finalArgs.slice(this.alreadyStreamedArgs.length);
+          if (remaining.length > 0) {
+            toolCallDeltas.push({
+              index: this.currentToolIndex,
+              function: {
+                arguments: remaining,
+              },
+            });
+          }
+        }
+        this.currentToolIndex++;
+        return { textDelta: "", toolCalls: [parsed], toolCallDeltas };
       }
-      return { textDelta: `${OPEN_TAG}${leftover}`, toolCalls: [] };
+      return {
+        textDelta: `${OPEN_TAG}${leftover}`,
+        toolCalls: [],
+        toolCallDeltas: [],
+      };
     }
-    return { textDelta: leftover, toolCalls: [] };
+    return { textDelta: leftover, toolCalls: [], toolCallDeltas: [] };
   }
 
   private findPartialSuffixLength(text: string, tag: string): number {
@@ -199,10 +350,21 @@ export class ToolStreamParser {
         .trim();
       const obj = JSON.parse(cleaned);
       if (obj && typeof obj.name === "string") {
-        const argsString =
-          typeof obj.arguments === "string"
-            ? obj.arguments
-            : JSON.stringify(obj.arguments ?? {});
+        const argsMatch = /"arguments"\s*:\s*/.exec(cleaned);
+        let argsString = "";
+        if (argsMatch) {
+          const start = argsMatch.index + argsMatch[0].length;
+          const lastBrace = cleaned.lastIndexOf("}");
+          if (lastBrace > start) {
+            argsString = cleaned.slice(start, lastBrace).trim();
+          }
+        }
+        if (!argsString) {
+          argsString =
+            typeof obj.arguments === "string"
+              ? obj.arguments
+              : JSON.stringify(obj.arguments ?? {});
+        }
         return {
           id: `call_${crypto.randomBytes(12).toString("hex")}`,
           type: "function",

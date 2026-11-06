@@ -280,6 +280,25 @@ export class AcpClient {
     return this.cachedModels;
   }
 
+  public async getFastestLowModel(): Promise<string> {
+    const models = await this.getAvailableModels();
+    const priority = [
+      "gemini-3.8-flash-low",
+      "gemini-3.8-flash-medium",
+      "gemini-4-argon-low",
+    ];
+    for (const p of priority) {
+      if (models.some((m) => m.modelId === p)) {
+        return p;
+      }
+    }
+    const anyLow = models.find((m) => m.modelId.endsWith("-low"));
+    if (anyLow) return anyLow.modelId;
+    const anyFlash = models.find((m) => m.modelId.includes("flash"));
+    if (anyFlash) return anyFlash.modelId;
+    return models[0]?.modelId ?? "gemini-3.8-flash-low";
+  }
+
   public async setModel(sessionId: string, modelId: string): Promise<void> {
     await this.ensureStarted();
     await this.sendRequest("session/set_model", {

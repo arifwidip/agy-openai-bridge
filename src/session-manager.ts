@@ -17,6 +17,15 @@ interface CachedSession {
   lastUsedAt: number;
 }
 
+export interface StandbySession {
+  sessionId: string;
+  baseModelId: string;
+  isAgentMode: boolean;
+  cwd: string;
+  systemPromptAppend: string;
+  systemHash: string;
+}
+
 export interface AcquiredSession {
   sessionId: string;
   promptBlocks: AcpPromptContentBlock[];
@@ -30,11 +39,112 @@ export interface AcquiredSession {
 
 export class SessionManager {
   private sessions = new Map<string, CachedSession>();
+  private standbySession: StandbySession | null = null;
+  private replenishingStandby = false;
+  private utilitySessionId: string | null = null;
+  private utilityModelId: string | null = null;
 
   constructor(
     private readonly acp: AcpClient,
     private readonly maxCachedSessions: number = 50
   ) {}
+
+  public getStandbySession(): StandbySession | null {
+    return this.standbySession;
+  }
+
+  public getUtilitySessionId(): string | null {
+    return this.utilitySessionId;
+  }
+
+  public async acquireUtilitySession(opts: {
+    cwd: string;
+    messages: OpenAIChatMessage[];
+    systemInstructions?: string;
+  }): Promise<AcquiredSession> {
+    const fastModel = await this.acp.getFastestLowModel();
+
+    let reused = true;
+    if (!this.utilitySessionId) {
+      reused = false;
+      const created = await this.acp.newSession({ cwd: opts.cwd }, false);
+      if (fastModel && created.currentModelId !== fastModel) {
+        await this.acp.setModel(created.sessionId, fastModel).catch(() => {});
+      }
+      this.utilitySessionId = created.sessionId;
+      this.utilityModelId = fastModel;
+    }
+
+    const promptText = [
+      opts.systemInstructions
+        ? `[INSTRUCTIONS]\n${opts.systemInstructions}\n`
+        : "",
+      ...opts.messages.map((m) => {
+        const txt = this.extractTextOnly(m);
+        return `[${m.role}]:\n${txt}`;
+      }),
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    const promptBlocks: AcpPromptContentBlock[] = [
+      {
+        type: "text",
+        text: promptText,
+      },
+    ];
+
+    return {
+      sessionId: this.utilitySessionId,
+      promptBlocks,
+      reused,
+      finalizeTurn: () => {},
+      releaseOnError: async () => {
+        if (this.utilitySessionId) {
+          const sid = this.utilitySessionId;
+          this.utilitySessionId = null;
+          await this.acp.closeSession(sid).catch(() => {});
+        }
+      },
+    };
+  }
+
+  public triggerReplenishStandby(params: {
+    baseModelId: string;
+    isAgentMode: boolean;
+    cwd: string;
+    systemPromptAppend: string;
+    systemHash: string;
+  }): void {
+    if (this.replenishingStandby || this.standbySession) return;
+    this.replenishingStandby = true;
+    (async () => {
+      try {
+        const created = await this.acp.newSession(
+          {
+            cwd: params.cwd,
+            systemPromptAppend: params.systemPromptAppend || undefined,
+          },
+          params.isAgentMode
+        );
+        if (params.baseModelId && created.currentModelId !== params.baseModelId) {
+          await this.acp.setModel(created.sessionId, params.baseModelId).catch(() => {});
+        }
+        this.standbySession = {
+          sessionId: created.sessionId,
+          baseModelId: params.baseModelId,
+          isAgentMode: params.isAgentMode,
+          cwd: params.cwd,
+          systemPromptAppend: params.systemPromptAppend,
+          systemHash: params.systemHash,
+        };
+      } catch {
+        // Ignore background replenishment failure
+      } finally {
+        this.replenishingStandby = false;
+      }
+    })();
+  }
 
   public async acquireSession(opts: {
     baseModelId: string;
@@ -111,6 +221,65 @@ export class SessionManager {
       }
     }
 
+    // Check if standby pre-warmed session matches!
+    if (
+      this.standbySession &&
+      this.standbySession.systemHash === systemHash &&
+      this.standbySession.cwd === cwd &&
+      this.standbySession.baseModelId === baseModelId &&
+      this.standbySession.isAgentMode === isAgentMode
+    ) {
+      const standby = this.standbySession;
+      this.standbySession = null;
+
+      await this.evictIfNeeded();
+      const cached: CachedSession = {
+        sessionId: standby.sessionId,
+        baseModelId,
+        isAgentMode,
+        cwd,
+        systemHash,
+        prefixHash: "",
+        busy: true,
+        lastUsedAt: Date.now(),
+      };
+      this.sessions.set(standby.sessionId, cached);
+
+      // Trigger replenishment for next task
+      this.triggerReplenishStandby({
+        baseModelId,
+        isAgentMode,
+        cwd,
+        systemPromptAppend,
+        systemHash,
+      });
+
+      const promptBlocks = this.messagesToPromptBlocks(nonSystemMessages, false);
+
+      return {
+        sessionId: standby.sessionId,
+        promptBlocks,
+        reused: false,
+        finalizeTurn: (assistantText, assistantToolCalls) => {
+          const syntheticAssistant: OpenAIChatMessage = {
+            role: "assistant",
+            content: assistantText || null,
+            ...(assistantToolCalls.length > 0
+              ? { tool_calls: assistantToolCalls }
+              : {}),
+          };
+          const nextHistory = [...nonSystemMessages, syntheticAssistant];
+          cached.prefixHash = this.hashMessages(systemHash, nextHistory);
+          cached.busy = false;
+          cached.lastUsedAt = Date.now();
+        },
+        releaseOnError: async () => {
+          this.sessions.delete(standby.sessionId);
+          await this.acp.closeSession(standby.sessionId);
+        },
+      };
+    }
+
     // Fallback: create a fresh ACP session and send full conversation history
     await this.evictIfNeeded();
     const created = await this.acp.newSession(
@@ -136,6 +305,15 @@ export class SessionManager {
       lastUsedAt: Date.now(),
     };
     this.sessions.set(created.sessionId, cached);
+
+    // Asynchronously replenish standby so the next task Turn 1 is pre-warmed
+    this.triggerReplenishStandby({
+      baseModelId,
+      isAgentMode,
+      cwd,
+      systemPromptAppend,
+      systemHash,
+    });
 
     const promptBlocks = this.messagesToPromptBlocks(nonSystemMessages, false);
 
@@ -303,7 +481,7 @@ export class SessionManager {
     return this.hashObject({ systemHash, normalized });
   }
 
-  private hashObject(obj: unknown): string {
+  public hashObject(obj: unknown): string {
     return crypto
       .createHash("sha256")
       .update(JSON.stringify(obj))

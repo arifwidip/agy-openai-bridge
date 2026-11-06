@@ -28,26 +28,69 @@ test("Library entrypoint (index.js) exports public classes and helpers without s
   assert.equal(typeof formatAgentInternalToolUpdate, "function");
 });
 
-test("ToolStreamParser extracts <agy_tool_call> across chunk boundaries", () => {
+test("ToolStreamParser progressively streams tool call argument deltas", () => {
   const parser = new ToolStreamParser(true);
 
-  const s1 = parser.push("Let me check the weather. <agy_tool");
-  assert.equal(s1.textDelta, "Let me check the weather. ");
+  // Chunk 1: introduces tag and tool name
+  const s1 = parser.push('<agy_tool_call>{"name": "write_file", "arguments": {"path": "a.ts", ');
+  assert.equal(s1.textDelta, "");
   assert.equal(s1.toolCalls.length, 0);
+  assert.ok(s1.toolCallDeltas.length >= 1);
+  assert.equal(s1.toolCallDeltas[0].function?.name, "write_file");
 
-  const s2 = parser.push(
-    '_call>\n{"name": "get_weather", "arguments": {"city": "Jakarta"}}\n</agy_tool_'
-  );
+  // Chunk 2: streams argument content
+  const s2 = parser.push('"content": "console.log(123);\\nconsole.log(456);\\n"');
   assert.equal(s2.textDelta, "");
   assert.equal(s2.toolCalls.length, 0);
+  assert.ok(s2.toolCallDeltas.length >= 1);
 
-  const s3 = parser.push("call>");
-  assert.equal(s3.textDelta, "");
+  // Chunk 3: closes tag
+  const s3 = parser.push('}}</agy_tool_call> Done!');
   assert.equal(s3.toolCalls.length, 1);
-  assert.equal(s3.toolCalls[0].function.name, "get_weather");
-  assert.deepEqual(JSON.parse(s3.toolCalls[0].function.arguments), {
-    city: "Jakarta",
-  });
+  assert.equal(s3.textDelta, " Done!");
+
+  // Verify all deltas combined match the finalized arguments exactly
+  const allDeltas = [...s1.toolCallDeltas, ...s2.toolCallDeltas, ...s3.toolCallDeltas];
+  const combinedArgs = allDeltas
+    .map((d) => d.function?.arguments ?? "")
+    .join("");
+  assert.deepEqual(
+    JSON.parse(combinedArgs),
+    JSON.parse(s3.toolCalls[0].function.arguments)
+  );
+  assert.equal(JSON.parse(combinedArgs).path, "a.ts");
+});
+
+test("ToolStreamParser flush handles unclosed tag gracefully", () => {
+  const parser = new ToolStreamParser(true);
+  parser.push('<agy_tool_call>{"name": "test_tool", "arguments": {"foo": "bar"}}');
+  const flushed = parser.flush();
+  assert.equal(flushed.toolCalls.length, 1);
+  assert.equal(flushed.toolCalls[0].function.name, "test_tool");
+  assert.deepEqual(JSON.parse(flushed.toolCalls[0].function.arguments), { foo: "bar" });
+});
+
+test("buildSystemPromptAppend produces compact minified tool JSON without 2-space indentation", () => {
+  const append = buildSystemPromptAppend(
+    {
+      model: "test-model",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "test_tool",
+            description: "test description",
+            parameters: { type: "object", properties: { x: { type: "string" } } },
+          },
+        },
+      ],
+    },
+    [],
+    false
+  );
+  assert.ok(append.includes('{"name":"test_tool"'));
+  assert.ok(!append.includes('{\n  "name": "test_tool"'));
 });
 
 test("SessionManager reuses session on append-only turns and creates new session on history edit (offline)", async () => {
@@ -93,22 +136,123 @@ test("SessionManager reuses session on append-only turns and creates new session
   assert.equal(turn2.reused, true);
   assert.equal(turn2.sessionId, "sess_1");
   turn2.finalizeTurn("Follow-up answer", []);
+});
 
-  // Turn 3 with mutated history prefix -> should allocate sess_2
-  const turn3Mutated = await manager.acquireSession({
+test("SessionManager utility session routes to fast model and does not disrupt main session cache", async () => {
+  let nextId = 1;
+  const fakeAcp = {
+    async getFastestLowModel() {
+      return "gemini-3.8-flash-low";
+    },
+    async newSession() {
+      return {
+        sessionId: `sess_${nextId++}`,
+        availableModels: [],
+        currentModelId: "gemini-3.8-flash-low",
+      };
+    },
+    async setModel() {},
+    async closeSession() {},
+  } as unknown as AcpClient;
+
+  const manager = new SessionManager(fakeAcp, 10);
+
+  // 1. Establish an active main agent session
+  const agentTurn1 = await manager.acquireSession({
+    baseModelId: "claude-sonnet-5-5-high",
+    isAgentMode: false,
+    cwd: "/tmp",
+    systemPromptAppend: "agent-tools-prompt",
+    nonSystemMessages: [{ role: "user", content: "Start coding" }],
+  });
+  agentTurn1.finalizeTurn("I will help you code.", []);
+  assert.equal(agentTurn1.sessionId, "sess_1");
+
+  // 2. OpenCode fires a title generator request
+  const titleTurn = await manager.acquireUtilitySession({
+    cwd: "/tmp",
+    messages: [{ role: "user", content: "Start coding" }],
+    systemInstructions: "You are a title generator. You output ONLY a thread title.",
+  });
+  const utilityId = titleTurn.sessionId;
+  assert.ok(utilityId);
+  assert.equal(manager.getUtilitySessionId(), utilityId);
+
+  // Subsequent title prompt reuses utility session
+  const titleTurn2 = await manager.acquireUtilitySession({
+    cwd: "/tmp",
+    messages: [{ role: "user", content: "Second thread" }],
+  });
+  assert.equal(titleTurn2.sessionId, utilityId);
+  assert.equal(titleTurn2.reused, true);
+
+  // 3. Main agent session continues: turn 2 MUST still match sess_1 without cache invalidation!
+  const agentTurn2 = await manager.acquireSession({
+    baseModelId: "claude-sonnet-5-5-high",
+    isAgentMode: false,
+    cwd: "/tmp",
+    systemPromptAppend: "agent-tools-prompt",
+    nonSystemMessages: [
+      { role: "user", content: "Start coding" },
+      { role: "assistant", content: "I will help you code." },
+      { role: "user", content: "Create a file" },
+    ],
+  });
+  assert.equal(agentTurn2.reused, true);
+  assert.equal(agentTurn2.sessionId, "sess_1");
+});
+
+test("SessionManager pre-warms standby session and claims it on new conversation Turn 1", async () => {
+  let nextId = 1;
+  const fakeAcp = {
+    async getFastestLowModel() {
+      return "gemini-3.8-flash-low";
+    },
+    async newSession() {
+      return {
+        sessionId: `sess_${nextId++}`,
+        availableModels: [],
+        currentModelId: "gemini-3.8-flash-low",
+      };
+    },
+    async setModel() {},
+    async closeSession() {},
+  } as unknown as AcpClient;
+
+  const manager = new SessionManager(fakeAcp, 10);
+
+  // First session creation
+  const t1 = await manager.acquireSession({
     baseModelId: "gemini-3.8-flash-low",
     isAgentMode: false,
     cwd: "/tmp",
     systemPromptAppend: "sys",
-    nonSystemMessages: [
-      { role: "user", content: "Edited first message" },
-      { role: "assistant", content: "Hi there!" },
-      { role: "user", content: "Follow-up question" },
-    ],
+    nonSystemMessages: [{ role: "user", content: "Task 1" }],
   });
-  assert.equal(turn3Mutated.reused, false);
-  assert.equal(turn3Mutated.sessionId, "sess_2");
-  turn3Mutated.finalizeTurn("Fresh answer", []);
+  assert.equal(t1.sessionId, "sess_1");
+
+  // Wait a tick for async background replenishment to complete
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const standby = manager.getStandbySession();
+  assert.ok(standby, "Standby session should be pre-warmed in background");
+  assert.equal(standby.sessionId, "sess_2");
+
+  // Starting a brand new conversation with matching system setup claims sess_2 immediately!
+  const t2Fresh = await manager.acquireSession({
+    baseModelId: "gemini-3.8-flash-low",
+    isAgentMode: false,
+    cwd: "/tmp",
+    systemPromptAppend: "sys",
+    nonSystemMessages: [{ role: "user", content: "Brand new task 2" }],
+  });
+  assert.equal(t2Fresh.sessionId, "sess_2");
+
+  // Wait for next replenishment
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const nextStandby = manager.getStandbySession();
+  assert.ok(nextStandby);
+  assert.equal(nextStandby.sessionId, "sess_3");
 });
 
 const hasAgy = isAgyAvailable();
